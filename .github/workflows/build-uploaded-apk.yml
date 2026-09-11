@@ -1,0 +1,336 @@
+name: Build uploaded Android ZIP
+
+on:
+  repository_dispatch:
+    types: [build_apk]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      JOB_ID: ${{ github.event.client_payload.job_id }}
+      SOURCE_URL: ${{ github.event.client_payload.source_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      ACTION_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Baixar projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/apkbuild/src
+
+          echo "Baixando projeto..."
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            "$SOURCE_URL" \
+            -o /tmp/apkbuild/project.zip
+
+          echo "Extraindo ZIP..."
+          unzip -q /tmp/apkbuild/project.zip -d /tmp/apkbuild/src
+
+          echo "Projeto baixado."
+
+      - name: Localizar e compilar projeto
+        id: compile
+        shell: bash
+        run: |
+          set +e
+
+          ROOT=""
+
+          echo "Procurando projeto Android..."
+
+          if [ -f /tmp/apkbuild/src/settings.gradle ] || \
+             [ -f /tmp/apkbuild/src/settings.gradle.kts ]; then
+
+            ROOT="/tmp/apkbuild/src"
+
+          else
+
+            SETTINGS=$(find /tmp/apkbuild/src \
+              -maxdepth 5 \
+              -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              | head -n 1)
+
+            if [ -n "$SETTINGS" ]; then
+              ROOT=$(dirname "$SETTINGS")
+            fi
+
+          fi
+
+          if [ -z "$ROOT" ]; then
+
+            echo "Não encontrei settings.gradle ou settings.gradle.kts dentro do ZIP." \
+              | tee /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "Projeto encontrado em:"
+          echo "$ROOT"
+
+          cd "$ROOT"
+
+          if [ -f gradlew ]; then
+
+            echo "Usando Gradle Wrapper do projeto."
+
+            chmod +x gradlew
+
+            ./gradlew \
+              --no-daemon \
+              assembleDebug \
+              2>&1 | tee /tmp/apkbuild/build.log
+
+            CODE=${PIPESTATUS[0]}
+
+          else
+
+            echo "gradlew não encontrado."
+            echo "Usando Gradle 8.9 instalado pelo GitHub Actions."
+
+            gradle \
+              --no-daemon \
+              assembleDebug \
+              2>&1 | tee /tmp/apkbuild/build.log
+
+            CODE=${PIPESTATUS[0]}
+
+          fi
+
+          if [ "$CODE" -ne 0 ]; then
+
+            echo "Falha durante a compilação."
+
+            tail -n 120 /tmp/apkbuild/build.log \
+              > /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "Procurando APK gerado..."
+
+          APK=$(find "$ROOT" \
+            -type f \
+            -path '*/build/outputs/apk/*/*.apk' \
+            ! -name '*androidTest*' \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+
+            echo "A compilação terminou, mas nenhum APK foi encontrado." \
+              > /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "APK encontrado:"
+          echo "$APK"
+
+          cp "$APK" /tmp/apkbuild/app-debug.apk
+
+          echo "result=success" >> "$GITHUB_OUTPUT"
+
+      - name: Devolver APK para Hostinger
+        if: steps.compile.outputs.result == 'success'
+        shell: bash
+        run: |
+          echo "Enviando APK para Hostinger..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            -H "X-Builder-Secret: ${{ secrets.HOSTINGER_CALLBACK_SECRET }}" \
+            -F "job_id=$JOB_ID" \
+            -F "status=success" \
+            -F "action_url=$ACTION_URL" \
+            -F "apk=@/tmp/apkbuild/app-debug.apk;type=application/vnd.android.package-archive" \
+            "$CALLBACK_URL"
+
+          echo "APK enviado."
+
+      - name: Informar falha à Hostinger
+        if: steps.compile.outputs.result != 'success'
+        shell: bash
+        run: |
+          MSG=$(tail -c 5000 /tmp/apkbuild/error.txt 2>/dev/null || \
+            echo "Falha desconhecida durante a compilação.")
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            -H "X-Builder-Secret: ${{ secrets.HOSTINGER_CALLBACK_SECRET }}" \
+            -F "job_id=$JOB_ID" \
+            -F "status=error" \
+            -F "action_url=$ACTION_URL" \
+            -F "message=$MSG" \
+            "$CALLBACK_URL"             [ -f /tmp/apkbuild/src/settings.gradle.kts ]; then
+
+            ROOT="/tmp/apkbuild/src"
+
+          else
+
+            SETTINGS=$(find /tmp/apkbuild/src \
+              -maxdepth 5 \
+              -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              | head -n 1)
+
+            if [ -n "$SETTINGS" ]; then
+              ROOT=$(dirname "$SETTINGS")
+            fi
+
+          fi
+
+          if [ -z "$ROOT" ]; then
+
+            echo "Não encontrei settings.gradle ou settings.gradle.kts dentro do ZIP." \
+              | tee /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "Projeto encontrado em:"
+          echo "$ROOT"
+
+          cd "$ROOT"
+
+          if [ -f gradlew ]; then
+
+            echo "Usando Gradle Wrapper do projeto."
+
+            chmod +x gradlew
+
+            ./gradlew \
+              --no-daemon \
+              assembleDebug \
+              2>&1 | tee /tmp/apkbuild/build.log
+
+            CODE=${PIPESTATUS[0]}
+
+          else
+
+            echo "gradlew não encontrado."
+            echo "Usando Gradle 8.9 instalado pelo GitHub Actions."
+
+            gradle \
+              --no-daemon \
+              assembleDebug \
+              2>&1 | tee /tmp/apkbuild/build.log
+
+            CODE=${PIPESTATUS[0]}
+
+          fi
+
+          if [ "$CODE" -ne 0 ]; then
+
+            echo "Falha durante a compilação."
+
+            tail -n 120 /tmp/apkbuild/build.log \
+              > /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "Procurando APK gerado..."
+
+          APK=$(find "$ROOT" \
+            -type f \
+            -path '*/build/outputs/apk/*/*.apk' \
+            ! -name '*androidTest*' \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+
+            echo "A compilação terminou, mas nenhum APK foi encontrado." \
+              > /tmp/apkbuild/error.txt
+
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 0
+
+          fi
+
+          echo "APK encontrado:"
+          echo "$APK"
+
+          cp "$APK" /tmp/apkbuild/app-debug.apk
+
+          echo "result=success" >> "$GITHUB_OUTPUT"
+
+      - name: Devolver APK para Hostinger
+        if: steps.compile.outputs.result == 'success'
+        shell: bash
+        run: |
+          echo "Enviando APK para Hostinger..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            -H "X-Builder-Secret: ${{ secrets.HOSTINGER_CALLBACK_SECRET }}" \
+            -F "job_id=$JOB_ID" \
+            -F "status=success" \
+            -F "action_url=$ACTION_URL" \
+            -F "apk=@/tmp/apkbuild/app-debug.apk;type=application/vnd.android.package-archive" \
+            "$CALLBACK_URL"
+
+          echo "APK enviado."
+
+      - name: Informar falha à Hostinger
+        if: steps.compile.outputs.result != 'success'
+        shell: bash
+        run: |
+          MSG=$(tail -c 5000 /tmp/apkbuild/error.txt 2>/dev/null || \
+            echo "Falha desconhecida durante a compilação.")
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            -H "X-Builder-Secret: ${{ secrets.HOSTINGER_CALLBACK_SECRET }}" \
+            -F "job_id=$JOB_ID" \
+            -F "status=error" \
+            -F "action_url=$ACTION_URL" \
+            -F "message=$MSG" \
+            "$CALLBACK_URL"
